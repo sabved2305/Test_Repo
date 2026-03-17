@@ -19,7 +19,7 @@ Multiple LLM providers (OpenAI, Azure OpenAI, Gemini) are supported, each with d
 - **Multi-provider schema compatibility:** Each LLM provider (OpenAI, Azure, Gemini) has different schema requirements that tool definitions must accommodate.
 - **Agent handoff with state preservation:** Agents must route control mid-conversation while preserving thread history and workflow state.
 - **Selective output filtering:** Tool outputs may need to be trimmed before returning to the LLM to reduce token usage, while remaining fully available for state updates and debugging.
-- **Full parameter visibility in UI:** The UI must display all parameters a tool actually received (static + dynamic), not just the LLM-generated subset.
+- **Full parameter visibility:** Full parameter visibility: Resolved parameters (static + dynamic) are stored in _toolDebug for Langfuse trace visibility, without polluting the LLM conversation history.
 
 **Business Value**
 
@@ -28,15 +28,15 @@ Multiple LLM providers (OpenAI, Azure OpenAI, Gemini) are supported, each with d
 **Predictable behavior**: user-configured values are never overridden by the LLM\
 **Safe concurrency**: fresh tool instances prevent parameter leakage between workflow runs\
 **Provider transparency:** tool schemas automatically adapt to the agent's LLM provider without any per-tool configuration\
-**Debugging transparency**: the UI displays all parameters a tool received, enabling effective troubleshooting\
+**Debugging transparency**: resolved parameters visible in Langfuse traces via _toolDebug; tool outputs available via toolResults
 
 #### Goals and Requirements
 
 | Goal | Description | Priority |
 |------|-------------|----------|
 | Unified parameter resolution | Merge static and LLM-generated sub-fields within the same parameter via recursive deep merge (`deepMergeObjects`) | High |
-| Accurate LLM schema exposure | Hide fully static parameters; for partially configured nested objects, expose only unconfigured sub-fields (`filterSchemaForLLM`) | High |
-| Full parameter visibility in UI | Attach complete merged parameters as `mergedArguments` in `ToolMessage.additional_kwargs` for UI display | High |
+| Accurate LLM schema exposure | Hide fully static parameters; for partially configured nested objects, expose only unconfigured sub-fields (`prepareSchemaForLLM`) | High |
+| Full parameter visibility | Resolved parameters stored in _toolDebug (Langfuse traces). Never enters LLM conversation history. | High
 | Consistent behavior across tool types | Same resolution and filtering for all tool types (MCP, Handoff, Knowledge) and both paths (agent tools, standalone `ToolNode`) | High |
 | Centralized schema filtering | Single shared utility (`schema.utils.ts`) for all recursive filtering, preventing duplication | Medium |
 | Arbitrary nesting support | Handle objects within objects, arrays of objects, and nullable types at any depth | High |
@@ -54,7 +54,7 @@ The tool calling system is organized into four layers, each with a clear respons
 | Definition | Converts UI tool configs into runtime `ToolDefinition` objects and maps tool types to their classes | Once at workflow load |
 | Schema | Filters the tool's JSON Schema to show only dynamic fields to the LLM, with provider-specific adjustments | Once at agent initialization |
 | Execution | Resolves templates, deep-merges static + dynamic params, and runs the tool's core logic | Every tool invocation |
-| Response | Extracts merged params from ToolMessages, builds UI tool calls, persists agent thread | After agent completes
+| Response | Extracts tool calls and results from agent state, persists agent thread | After agent completes
 For standalone Tool Nodes, only the Execution layer is used — there is no LLM, so schema filtering and response processing are not applicable.
 ### High-Level Design
 
@@ -108,7 +108,7 @@ For standalone Tool Nodes, only the Execution layer is used — there is no LLM,
 │                        schema.utils.ts                                       │
 │                                                                              │
 │  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐       │
-│  │ filterSchemaFor   │───▶│  drillSchemaNode  │───▶│     hasType      │       │
+│  │ prepareSchemaFor │───▶│drillParamSchema │───▶│     hasType      │       │
 │  │ LLM()             │    │  (recurse nested)  │    │ (nullable check) │       │
 │  │ (entry point)     │◀───│                    │    │                  │       │
 │  └──────────────────┘    └──────────────────┘    └──────────────────┘       │
@@ -153,7 +153,7 @@ AgentNode.initializeReactAgent()
   ├─▶ ToolManager.createAgentTools()
   │     ├── AgentToolConfig → ToolDefinition (convert + embed provider config)
   │     └── LangChainToolFactory.buildLangchainTools()
-  │           ├── getLLMVisibleSchema() → filterSchemaForLLM() (hide static, expose dynamic)
+  │           ├── getLLMVisibleSchema() → prepareSchemaForLLM() (hide static, expose dynamic)
   │           ├── Inject thoughts/reasoning
   │           └── Wrap with coreTool() → LangChain tool
   │
@@ -215,8 +215,7 @@ AgentNode.process()
                 │         └── process()                      │
                 │               (MCPTool / HandoffTool /     │
                 │                KnowledgeTool / etc.)       │
-                │                                            │
-                ├── Capture mergedArguments                   │
+                │                                            │             
                 │                                            │
                 └── Return path:                             │
                       │                                      │
@@ -244,9 +243,8 @@ AgentNode.process()
              Return Command   processAgentResponse()
              directly to           │
              LangGraph             ├── Extract text from last AIMessage
-             (skip response        ├── Build mergedArgsLookup
-              processing)          │     (from ToolMessage.additional_kwargs)
-                                   ├── Extract toolCalls with merged params
+             (skip response        |
+              processing)          ├── Extract toolCalls from AIMessage (call.args)
                                    ├── Extract toolResults from agent state
                                    ├── Detect returnDirect interrupt
                                    └── Return { text, toolCalls, toolResults,
@@ -293,11 +291,7 @@ ToolNode.process()
 | Fresh tool instances per invocation | Prevents parameter leakage between concurrent workflows |
 | Three return paths (string / ToolMessage / Command) | Different tools need simple output, metadata, or state updates + routing |
 | Handoff bypasses response processing | Command exits agent immediately; HandoffTool persists thread and state explicitly |
-| `mergedArguments` via ToolMessage metadata | UI gets full params without patching AIMessage or polluting LLM history |
 | State explicitly preserved in every Command | `createAgent` replaces state fields — without spreading existing values, they'd be wiped |
-
-
-
 
 
 ## 4. Detailed Design
@@ -336,20 +330,20 @@ Converts UI-facing `AgentToolConfig` to runtime `ToolDefinition`. Generates uniq
 
 | Function | What it does |
 | --- | --- |
-| `filterSchemaForLLM()` | Entry point. Expose dynamic fields, hide static primitives, delegate partial objects to `drillSchemaNode()` |
-| `drillSchemaNode()` | Recursively processes nested objects (`properties`) and arrays (`items`). Returns filtered node or `null` if fully static |
+| `prepareSchemaForLLM()` | Entry point. Expose dynamic fields, hide static primitives, delegate partial objects to `drillParamSchema()` |
+| `drillParamSchema()` | Recursively processes nested objects (`properties`) and arrays (`items`). Returns filtered node or `null` if fully static |
 | `hasType()` | Handles nullable types like `["object", "null"]` that a simple string check would miss |
 
 Includes prototype pollution protection — skips `__proto__`, `constructor`, `prototype`.
 
-`getLLMVisibleSchema()` in `LangChainToolFactory.ts` calls `filterSchemaForLLM()` once, applies provider-specific adjustments (Gemini: strip date formats, handle nullable types), and injects `thoughts`/`reasoning` if enabled.
+`getLLMVisibleSchema()` in `LangChainToolFactory.ts` calls `prepareSchemaForLLM()` once, applies provider-specific adjustments (Gemini: strip date formats, handle nullable types), and injects `thoughts`/`reasoning` if enabled.
 
 ---
 ### 4.3 Schema Building & Tool Wrapping
 **File:** `LangChainToolFactory.ts`
 | Method | What it does |
 | --- | --- |
-| `getLLMVisibleSchema()` | Calls `filterSchemaForLLM()` once, applies Gemini adjustments (strip date formats, handle nullable types) |
+| `getLLMVisibleSchema()` | Calls `prepareSchemaForLLM()` once, applies Gemini adjustments (strip date formats, handle nullable types) |
 | `buildLLMSchema()` | Adds `thoughts`/`reasoning` if enabled, sets `additionalProperties` per provider |
 | `createLangChainTool()` | Wraps with `coreTool()` using filtered schema. Sets alias as LLM name, attaches metadata |
 | `createHandoffTool()` | Same wrapping but does NOT set `returnDirect` (Command handles exit) |
@@ -366,7 +360,7 @@ When the LLM calls a tool, `createLangchainToolFunction()` executes:
 | 1. Parse & sanitize | Handle input, strip `thoughts`/`reasoning` |
 | 2. Fresh instance | `instantiateToolFromDefinition()` — no singletons |
 | 3. Invoke | `BaseTool.invoke()` → `resolveParameters()` → `process()` |
-| 4. Capture | `mergedArguments = result.resolvedParameters` |
+| 4. Debug | Store resolvedParameters in _toolDebug for Langfuse trace visibility |
 | 5. Return | Based on config (see below) |
 
 **Return path decision:**
@@ -409,7 +403,7 @@ Creates `Command({ goto: targetNodeId, graph: Command.PARENT })` for routing to 
 | Tool call ID | From `runtimeConfig.metadata`; fallback: infer from state. Required for Azure OpenAI. |
 | State persistence | Spreads existing variables + applies `variableUpdates`. Stores resolved params in `toolResults`. |
 | Thread persistence | Saves agent conversation in Command (since `afterAgent` is bypassed) |
-| UI metadata | Attaches `mergedArguments` and `node_metadata` to ToolMessage |
+| UI metadata | Attaches `node_metadata` to ToolMessage. Stores resolvedParameters in _toolDebug. |
 
 ---
 
@@ -432,12 +426,12 @@ Creates `Command({ goto: targetNodeId, graph: Command.PARENT })` for routing to 
 | Step | What it extracts |
 | --- | --- |
 | Text | From last AIMessage content |
-| Tool calls | From AIMessage `tool_calls`, enriched with `mergedArgsLookup` for full params |
+| Tool calls | From AIMessage tool_calls (LLM-generated parameters via call.args)|
 | Tool results | From `response.variables.nodes[nodeId].toolResults` |
 | Interrupt | Detected if last message is ToolMessage from a `returnDirect` tool |
 | Variables | `agentFinalVariables` propagated to parent graph |
 
-Handoff Commands bypass this entirely — returned directly before `processAgentResponse` is called. Standalone Tool Nodes (`ToolNode.ts`) call `BaseTool.invoke(state, {}, config)` with empty LLM arguments — all params static, no schema filtering or response processing needed.
+Handoff Commands bypass this entirely — returned directly before `processAgentResponse` is called. Standalone Tool Nodes (`ToolNode.ts`) call `BaseTool.invoke(state, {}, config)` with empty LLM arguments — all params static, no schema filtering or response processing needed. Tool output is always returned directly in ProcessOutput.data.result — visible in UI and state without captureRawResponse.
 
 ## 5. Implementation
 ## Implementation
@@ -449,7 +443,7 @@ Handoff Commands bypass this entirely — returned directly before `processAgent
 | `AgentNode.ts` | Orchestration | Agent lifecycle, middleware (beforeAgent, wrapModelCall, afterAgent), response processing, handoff Command handling |
 | `ToolManager.ts` | Definition | Tool type registry, `AgentToolConfig` → `ToolDefinition` conversion, validation, factory orchestration |
 | `LangChainToolFactory.ts` | Schema / Execution | Schema building (`getLLMVisibleSchema`), LangChain tool wrapping (`coreTool`), tool execution function, output projection |
-| `schema.utils.ts` | Schema | Recursive schema filtering (`filterSchemaForLLM`, `drillSchemaNode`, `hasType`). Shared across factory and BaseTool paths. |
+| `schema.utils.ts` | Schema | Recursive schema filtering (`prepareSchemaForLLM`, `drillParamSchema`, `hasType`). Shared across factory and BaseTool paths. |
 | `BaseTool.ts` | Execution | Abstract base class. Parameter resolution (`resolveParameters`, `deepMergeObjects`), invoke lifecycle, variable updates, PV event dispatching |
 | `HandoffTool.ts` | Execution | Handoff routing via `Command`. Tool call ID management, thread persistence, state propagation |
 | `MCPTool.ts` | Execution | MCP server tool invocation |
@@ -501,14 +495,14 @@ Handoff Commands bypass this entirely — returned directly before `processAgent
 
 | Concern | Mitigation |
 | --- | --- |
-| Prototype pollution via parameter keys | `filterSchemaForLLM` and `deepMergeObjects` skip `__proto__`, `constructor`, `prototype` |
+| Prototype pollution via parameter keys | `prepareSchemaForLLM` and `deepMergeObjects` skip `__proto__`, `constructor`, `prototype` |
 | Sensitive data exposed to LLM | Static params hidden from LLM schema — only dynamic fields visible |
 
 ### Observability
 
 | Concern | Mitigation |
 | --- | --- |
-| What params did the tool actually receive? | `mergedArguments` in ToolMessage `additional_kwargs` — visible in UI |
+| What params did the tool actually receive? | _toolDebug in Command updates — visible per-tool in Langfuse traces. Doesn't enter LLM conversation. |
 | Static params polluting Langfuse traces | Never enter `AIMessage.tool_calls[].args` — traces reflect actual LLM behavior |
 | Tool execution lifecycle | `BaseTool.invoke()` logs start/success/error with tool name and duration |
 
@@ -570,7 +564,7 @@ Schema:        reason (string), context (string)
 Static params: (none — all dynamic)
 LLM generates: { reason: "needs billing info", context: "user asked about invoice" }
 HandoffTool:   Command({ goto: "billing_agent" })
-               ToolMessage with mergedArguments + node_metadata
+               ToolMessage with node_metadata
                State: handoffActive: true, toolResults: { handoff: { from, to, reason, context } }
 ```
 
@@ -591,7 +585,7 @@ Tool receives: { query: "monthly report", tenantId: "tenant_abc" }
 - LLM only generates what it needs — saves tokens and prevents overriding user-configured values
 - Nested objects work at arbitrary depth with recursive filtering and deep merge
 - No cross-workflow parameter leakage — fresh instances per invocation
-- UI shows full merged parameters for debugging; Langfuse traces stay clean
+- Langfuse traces stay clean — static params never enter LLM conversation history. Resolved params visible per-tool via _toolDebug in Langfuse.
 - Same execution path for all tool types — consistent behavior across MCP, handoff, knowledge tools
 - Template variables enable dynamic parameter values that resolve at runtime from workflow state
 - Cross-tool data passing via `captureRawResponse` + template references
@@ -605,7 +599,6 @@ Tool receives: { query: "monthly report", tenantId: "tenant_abc" }
 
 - Handoff tools bypass `processAgentResponse()` — data travels in the Command instead. Future logic added to `processAgentResponse` won't apply to handoff flows.
 - Fresh tool instances use slightly more memory per invocation, but MCP connections are pooled separately so the real cost is minimal
-- `mergedArguments` attached for all tools that return ToolMessage or Command (most tools). Simple tools returning plain string show only LLM-generated params in UI — uncommon in practice.
 - `thoughts`/`reasoning` injected and stripped per call — small overhead, enables AG-UI streaming without polluting tool inputs
 - Provider-specific adjustments (Gemini date formats, nullable types) add conditional branches but are isolated in `getLLMVisibleSchema`
 - Schema filtering runs once at init, not per call — no runtime impact but adds initialization time
@@ -645,7 +638,7 @@ Tool receives: { query: "monthly report", tenantId: "tenant_abc" }
 - Tool output control (`llmProjection`, `captureRawResponse`, `variableUpdates`)
 - Handoff routing with state and thread persistence
 - Agent middleware and thread management
-- UI display of merged parameters via `mergedArguments`
+- Resolved parameter visibility via _toolDebug (Langfuse)
 
 ### Out of Scope (Deferred)
 
