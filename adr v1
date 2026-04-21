@@ -1,0 +1,616 @@
+# ADR-007: Invoke V2 — A2A Message Response for Agents-as-APIs
+
+| **Status**       | Accepted |
+|------------------|----------|
+| **Author(s)**    | [Name] |
+| **Created**      | 2026-04-21 |
+| **Last Updated** | 2026-04-21 |
+| **Approvers**    | [TBD] |
+| **Supersedes**   | N/A |
+| **Superseded by**| N/A |
+
+---
+
+## Abstract
+
+Our existing `/invoke` endpoint (V0/V1) returns a Leo-specific envelope (`GepReturnDto`) that drops widgets, has no ordering between text and widgets, leaks internal state, and doesn't validate inputs. It's fine for chat-UI fallbacks but unusable when an agent has to be called like an API — by another service, an automation, or a third-party integration.
+
+Invoke V2 replaces it with `POST /v2/workflow-engine/:id/invoke`, which returns an **A2A Message** (Google's open Agent-to-Agent protocol): an ordered `parts[]` of text and widgets, plus a clean `metadata` block. It works by reusing the existing streaming pipeline and having a subscriber (`A2AStreamCollector`) assemble the AG-UI event stream into an A2A Message. No new state variables, no schema changes required on existing workflows.
+
+---
+
+## 1. Why this ADR exists
+
+### The two ways agents are consumed today
+
+| Transport | Endpoint | Who calls it |
+|---|---|---|
+| Streaming (SSE) | `POST /workflow-engine/:id/stream` | Chat UI, copilots, embedded assistants |
+| Invoke (V0/V1) | `POST /workflow-engine/:id/invoke` | Legacy server-to-server callers |
+
+The streaming path is feature-complete: it carries text tokens, tool calls, step events, widgets, HITL interrupts, and reasoning events — all as AG-UI events. The invoke path was bolted on later. It blocks on `compiledGraph.invoke()` and returns:
+
+```json
+{
+  "isSuccess": true,
+  "returnValue": {
+    "messages": [...],
+    "selectedAgentId": "...",
+    "state": { "flow": {}, "system": {}, "nodes": {} }
+  }
+}
+
+What's wrong with that
+1) Widgets are lost. PV (Partial-View) widgets are dispatched as CUSTOM SSE events (PV_PRE_RENDER / PV_TEMPLATE / PV_POST_RENDER). The blocking invoke() path never sees them, so the response only contains text.
+2) No content ordering. If the agent produces text → widget → text, there's nowhere in the response to represent that sequence.
+3) Proprietary format. Every consumer has to learn GepReturnDto. No open standard.
+4) State leaks. The full flow / system / nodes state is exposed alongside the answer, with no clean way to separate "the answer" from "internals".
+5) No input validation. A badly shaped request starts executing anyway; the LLM sees garbage and either hallucinates or crashes mid-run.
+
+Why now
+Product direction is moving toward agents as APIs — callable by other services, automations, agent-to-agent orchestrators, and external integrations. None of those consumers want a chat UI; they want a structured, ordered, standards-compliant response. V1 doesn't deliver that.
+
+What good looks like (Goals)
+#	Goal	Priority
+G1
+Open-standard response — return A2A Message { message_id, role, parts[], metadata }
+P0
+G2
+Preserve order of text and widgets as the agent produced them
+P0
+G3
+Include widgets (PV, A2UI) as first-class parts with media_type
+P0
+G4
+Clean separation — parts[] is the answer, metadata is side-channel info
+P0
+G5
+No duplicated logic between stream and invoke
+P0
+G6
+HITL interrupts work on invoke, not just stream
+P0
+G7
+Validate inputs before execution starts
+P1
+G8
+Graceful fallback for workflows that don't emit events
+P1
+G9
+/stream stays untouched
+P0
+G10
+Works on existing workflows with zero schema changes
+P1
+
+2. The decision
+In one sentence
+Invoke V2 runs the same streaming pipeline as /stream, and a subscriber called A2AStreamCollector turns the AG-UI event stream into an A2A Message.
+
+That's it. No new state variables. No output-node templating. No per-node wiring. If a workflow streams correctly, it invokes correctly.
+
+sequenceDiagram
+    participant Client
+    participant Controller as invokeV2()
+    participant Service as execute()
+    participant Adapter as streamExecutionObservable()
+    participant Collector as A2AStreamCollector
+
+    Client->>Controller: POST /v2/.../invoke
+    Controller->>Service: execute(id, dto)
+    Service->>Adapter: stream (streamMode: 'verbose')
+    Adapter-->>Collector: AG-UI events (text, widgets, HITL, ...)
+    Note over Collector: accumulates parts[] in order
+    Adapter-->>Collector: RUN_FINISHED (output)
+    Collector-->>Service: A2AMessage
+    Service-->>Controller: A2AMessage
+    Controller-->>Client: 200 OK (A2A JSON)
+
+Why not the alternatives
+Two other approaches were considered (and one was even implemented before being removed):
+
+Option	What it is	Why we didn't ship it
+A. Stream-and-collect ✅
+This ADR. Reuse stream events; collector builds parts
+Chosen
+B. Template parsing
+User writes finalAnswer on the output node with {{variable}} placeholders; transformer parses it into parts
+Every workflow needs a correctly-authored template; missing {{system.artifacts}} silently drops widgets. Parallel code path to stream. Fails G5 and G10.
+C. finalAnswer state accumulator
+A new flow variable that every content-producing node appends to during execution
+Previously implemented and removed. Required modifying every emitter node, duplicated content that already exists on thread.messages and in the event stream, grew state size over long sessions, needed per-node opt-out for guardrails/skills.
+
+Option C is important to call out because three of the source docs (a2a-invoke-response-proposal.md, invoke-api-approaches.md, invoke-v2-overview.md) describe it as the winning approach. It's not — it was removed. The header comment of A2AStreamCollector.ts preserves that history.
+
+3. What consumers see
+Happy path
+Agent receives "Show me my recent orders", looks up orders via a PV tool, summarises.
+
+Request:
+POST /v2/workflow-engine/wf-abc-123/invoke
+Content-Type: application/json
+
+{
+  "bpc": "BPC001",
+  "environment": "DEV",
+  "version": "1.0",
+  "interface": {
+    "inputs": { "message": "Show me my recent orders" }
+  },
+  "options": { "sessionId": "session-001" }
+}
+
+Response:
+{
+  "message_id": "msg_run_1709024400_abc123",
+  "role": "agent",
+  "parts": [
+    { "text": "Here are your recent orders:" },
+    {
+      "data": {
+        "preText": "Looking up order...",
+        "template": "<OrderTracker orderId='12345' />",
+        "postText": "Order found."
+      },
+      "media_type": "pv"
+    },
+    { "text": "Let me know if you need anything else." }
+  ],
+  "metadata": {
+    "status": "COMPLETED",
+    "runId": "run_1709024400_abc123",
+    "sessionId": "session-001",
+    "output": {
+      "selectedAgentId": "wf-abc-123",
+      "selectedAgentName": "Order Agent"
+    }
+  }
+}
+
+The client just renders parts top to bottom. Text → widget → text, in the exact order the agent produced them.
+
+HITL interrupt
+When the workflow pauses for human input (e.g. approval), V2 returns:
+{
+  "message_id": "msg_run_xyz",
+  "role": "agent",
+  "parts": [
+    { "text": "Please approve this refund before I continue." }
+  ],
+  "metadata": {
+    "status": "INTERRUPTED",
+    "runId": "run_xyz",
+    "sessionId": "session-001",
+    "output": {
+      "interrupt": {
+        "checkpointId": "...",
+        "nodeId": "approval-node",
+        "payload": { "message": "Please approve this refund before I continue." }
+      }
+    }
+  }
+}
+
+The consumer resumes by calling the same invokeV2 endpoint again, passing options.resume.metadata.checkpointId. The service detects the resume, replays events from the checkpoint, and returns another A2A Message (completed, interrupted again, or failed).
+
+Error:
+{
+  "message_id": "msg_error_1709024400",
+  "role": "agent",
+  "parts": [{ "text": "Input validation failed: message: Required" }],
+  "metadata": {
+    "status": "FAILED",
+    "errorCode": "EXECUTION_ERROR",
+    "runId": "run_error_1709024400",
+    "sessionId": "session-001"
+  }
+}
+Errors always look like A2A Messages — same shape, different status.
+
+4. How it works
+4.1 The A2AMessage type
+Defined in services/libs/shared/src/dtos/a2a/a2a.types.ts:
+
+export interface A2APart {
+  text?: string;
+  data?: any;
+  media_type?: string;    // "pv" | "a2ui" | future types
+  metadata?: Record<string, any>;
+}
+
+export interface A2AMessage {
+  message_id: string;
+  role: 'user' | 'agent';
+  parts: A2APart[];
+  metadata?: Record<string, any>;
+}
+
+Three kinds of parts show up in V2 responses:
+
+Part kind	Shape	When
+Text
+{ text: "..." }
+Agent / LLM node produces natural language
+PV widget
+{ data: { preText, template, postText }, media_type: "pv" }
+A Partial-View tool runs
+A2UI widget
+{ data: { surfaceId, rendererType, payload, ... }, media_type: "a2ui" }
+An A2UI-capable tool runs
+
+4.2 The collector (A2AStreamCollector)
+Lives at services/libs/agentic-engine/src/workflow-execution/A2AStreamCollector.ts. It's a static class with one public method:
+A2AStreamCollector.collect(stream$, runId, sessionId) → Promise<A2AMessage>
+
+Internally it holds four pieces of state while the stream runs:
+
+State	Purpose
+parts: A2APart[]
+The ordered output being built
+textBuffer: string
+In-flight text deltas between TEXT_MESSAGE_START and TEXT_MESSAGE_END
+pvBuffers: Map<toolCallId, {preText, template, postText}>
+In-flight PV widgets, keyed per tool call so concurrent tools don't mix
+hitlInterrupt: object | null
+Latest on_interrupt payload, if any
+
+Event	Action
+TEXT_MESSAGE_CONTENT
+Append delta to textBuffer
+TEXT_MESSAGE_END
+If textBuffer non-empty, push { text: textBuffer } to parts, reset
+CUSTOM / PV_PRE_RENDER
+Open a new PV buffer for this toolCallId with preText = delta
+CUSTOM / PV_TEMPLATE
+Set template = delta on the matching PV buffer
+CUSTOM / PV_POST_RENDER
+Set postText, flush any pending text first, then push the PV part, then delete the buffer
+CUSTOM / A2UI_MESSAGE
+Parse the delta JSON, flush pending text, push an A2UI part
+CUSTOM / on_interrupt
+Save the interrupt payload for metadata
+RUN_FINISHED
+Cache event.result for metadata on completion
+RUN_ERROR
+Resolve immediately with an error A2A Message
+Everything else
+Ignored (TOOL_CALL_*, STEP_*, STATE_*, etc.)
+
+
+Why text is flushed before a widget push: that's what preserves order. If the LLM says "here you go:" and then a tool fires, we need "here you go:" to land in parts before the widget, not after.
+
+On stream complete:
+
+Flush any leftover textBuffer.
+Build metadata from RUN_FINISHED.result.output (strip the reserved messages key).
+If there was an interrupt: set metadata.status = 'INTERRUPTED', put the payload under metadata.output.interrupt, push a text part with the interrupt message.
+If parts is still empty (degenerate case): fall back to the last AI message from output.messages.
+Resolve { message_id: 'msg_' + runId, role: 'agent', parts, metadata }.
+
+4.3 Metadata
+Top-level fields the collector always sets:
+
+Key	Values
+status
+"COMPLETED" / "FAILED" / "INTERRUPTED"
+errorCode
+String (only on failure)
+runId
+run_{timestamp}_{random}
+sessionId
+From request or auto-generated
+output
+Object of non-reserved output-node keys (omitted if empty)
+
+The only reserved key is messages (the conversation history). Everything else on the output node — selectedAgentId, selectedAgentName, user-defined keys like relatedQuestions — flows through to metadata.output.
+
+4.4 Input validation (Start node)
+The Start node (services/libs/agentic-engine/src/nodes/StartNode.ts) supports a JSON-Schema-flavored config called inputValidation:
+
+{
+  "inputValidation": {
+    "properties": {
+      "message":     { "type": "string", "minLength": 1 },
+      "attachments": { "type": "array" },
+      "count":       { "type": "number", "minimum": 1, "maximum": 100 }
+    },
+    "required": ["message"]
+  }
+}
+
+At run start, the node builds a Zod schema from properties and runs safeParse on interface.inputs. Validation failure throws, the graph emits RUN_ERROR, and the collector surfaces a FAILED A2A Message with a human-readable issue list.
+
+Supported types and validators:
+Type	Extra validators
+string
+minLength, maxLength, pattern, enum
+number
+minimum, maximum
+boolean
+—
+array
+(items are z.any())
+object
+(treated as z.record(z.any()))
+
+If inputValidation isn't configured, validation is skipped — backward compatible with existing workflows.
+
+4.5 The V1 execution path
+Happy path end-to-end, using the portal-engine service as reference (core has an identical path):
+
+Controller (workflow-engine.controller.ts)
+
+@Post(':id/invoke')
+@Version('2')
+@HttpCode(HttpStatus.OK)
+async invokeV2(
+  @Param('id') id: string,
+  @Body() request: InvokeApiRequestV1,
+): Promise<A2AMessage> {
+  try {
+    if (!request.options) { /* defaults */ }
+    if (!request.options.sessionId) { request.options.sessionId = uuidv4(); }
+    const dto = this.dtoAdapter.v1ToInternal(request);
+    return await this.workflowEngine.execute(id, dto);
+  } catch (error) {
+    return A2AResponseTransformer.buildErrorMessage(
+      error.message ?? 'An unexpected error occurred',
+      `run_error_${Date.now()}`,
+      request.options?.sessionId ?? 'unknown',
+      'EXECUTION_ERROR',
+    );
+  }
+}
+
+Service (workflow-engine.service.ts)
+async execute(id: string, invokeRequest: InvokeRequestDto): Promise<A2AMessage> {
+  this.request.headers['RuntimeToken'] = invokeRequest.options?.runtimeToken ?? '';
+  const headers = this.request.headers as Record<string, string>;
+
+  // HITL resume path omitted for brevity
+  // ...
+
+  const { compiledGraph, processedSchema } = await this.createGraph(id, invokeRequest);
+  const langfuseCallback = this.createLangfuseCallback(id, invokeRequest, ...);
+
+  const sessionId = invokeRequest.options?.sessionId || 'default';
+  const runId = `run_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+  const adapterRequest = WorkflowExecutionHelper.buildGraphRequest(
+    id, invokeRequest, interfaceInputs, headers,
+    [langfuseCallback], /*...*/
+    this.buildRuntimeContextForRequest(id, invokeRequest, ...),
+  );
+  adapterRequest.config = { ...adapterRequest.config, streamMode: 'verbose' };
+
+  const stream$ = this.adapter.streamExecutionObservable(compiledGraph, adapterRequest);
+  const tapped$ = await this.wrapV2WithSessionCapture(id, invokeRequest, sessionId, stream$);
+  return A2AStreamCollector.collect(tapped$, runId, sessionId);
+}
+
+Two things to notice:
+
+streamMode: 'verbose' is forced. minimal mode would drop PV widgets, so we override whatever the caller passed.
+wrapV2WithSessionCapture taps the stream for session capture (same as streaming), then the collector subscribes to the tapped observable.
+
+4.6 HITL resume
+Same /v2/.../invoke endpoint; the caller sets options.resume.metadata.checkpointId. The service detects it, calls handleResume(id, request, headers) (shared with the stream path), unwraps the emitted { data, type } events into raw AG-UI events, and feeds them into A2AStreamCollector.collect(...). Resume responses return the same A2A shape — completed, interrupted again, or failed.
+
+4.7 Three versions coexist
+Version	Endpoint	Returns
+V0 (default)
+POST /workflow-engine/:id/invoke
+GepReturnDto — legacy, unchanged
+V1
+POST /v1/workflow-engine/:id/invoke
+GepReturnDto — legacy, unchanged
+V2
+POST /v2/workflow-engine/:id/invoke
+A2AMessage — this ADR
+
+V0/V1 stay live until we confirm no internal consumers rely on them; deprecation will be a separate ADR.
+
+5. Stream vs V2 Invoke at a glance
+
+Aspect	/stream	/v2/.../invoke
+Transport
+SSE
+HTTP JSON
+Execution
+streamExecutionObservable()
+Same, forced to verbose
+Subscriber
+SSE serializer
+A2AStreamCollector.collect()
+Real-time events
+Yes, all of them
+No, collected in-memory
+Token streaming to client
+Yes
+No (buffered per message)
+Widgets (PV, A2UI)
+Yes (SSE)
+Yes (in parts[])
+HITL interrupts
+Yes
+Yes (status: INTERRUPTED)
+Langfuse tracing
+Yes
+Yes
+Session capture
+Yes
+Yes
+Tool / step / state events in response
+Yes
+No (ignored by collector)
+
+The important one: both paths share the same execution and event emission code. Anything the stream sees, the collector can see — which is what makes feature parity free.
+
+6. What's in the canvas
+These are tracked separately as UI work, but documented here so builders know where to configure V2:
+
+Endpoints panel (frontend/src/components/canvas/panel-content/EndpointsPanelContent.tsx) — published vs development URL toggle, development token, code snippets in multiple languages, response schema + example.
+Start node — builders can add typed input fields (message, attachments, or custom) with the validators listed in §4.4. inputValidation is optional.
+Output node — any key a builder adds (apart from the internal messages) will show up in metadata.output of the V2 response.
+Variables panel — inspect Variables / Threads / Runtime state during a run.
+
+7. Risks and trade-offs
+Risk	Why it matters	Mitigation
+Invoke pays the cost of running the streaming pipeline even though it doesn't stream
+Extra per-event overhead
+Acceptable — dominated by LLM latency. The alternative is a second code path that will drift from stream.
+A node that only updates state but doesn't emit events won't appear in parts[]
+Silent content loss
+Document: only streamed content reaches the response. Nodes wanting content in parts[] must emit TEXT_MESSAGE_* / CUSTOM events.
+Three invoke versions now coexist
+More surface to maintain
+V0/V1 are frozen; deprecation tracked separately.
+Legacy A2AResponseTransformer is dead code for the success path
+Risk of accidental reuse
+Header comment on A2AStreamCollector.ts documents the supersession. Cleanup tracked as tech debt.
+AG-UI event shapes change underneath us
+Breaks collector
+Unit tests on the collector against representative event fixtures.
+Consumers using V0/V1 assume messages is in the response
+messages is reserved and excluded from metadata.output
+Called out in the Endpoints panel; migration notes for V0/V1 → V2.
+
+8. Scope
+In
+POST /v2/workflow-engine/:id/invoke on both core and portal-engine
+A2AStreamCollector + A2AMessage / A2APart types
+HITL resume returning A2A
+Error A2A Messages (controller, execution, stream)
+Canvas Endpoints panel, Start node validation, Variables panel
+Keeping legacy A2AResponseTransformer alive only for buildErrorMessage
+
+Out
+Feature	Why not now
+Full A2A Task envelope (history + artifacts + JSON-RPC)
+Consumers only need Message today; Task can wrap this later
+Streaming A2A (A2A frames over SSE)
+Stream already exists via AG-UI; add if demanded
+Deprecation of V0/V1 invoke
+Separate ADR once consumer migration is done
+AG-UI protocol compliance fixes (wrong field names on REASONING_ENCRYPTED_VALUE, missing MESSAGES_SNAPSHOT, etc.)
+
+9. Files touched
+New
+
+File	Purpose
+services/libs/shared/src/dtos/a2a/a2a.types.ts
+A2APart, A2AMessage types
+services/libs/agentic-engine/src/workflow-execution/A2AStreamCollector.ts
+Subscribes to AG-UI stream, builds A2A Message
+
+Modified
+
+File	Change
+services/apps/{core,portal-engine}/src/workflow-engine/workflow-engine.controller.ts
+invokeV2() route with @Version('2')
+services/apps/{core,portal-engine}/src/workflow-engine/workflow-engine.service.ts
+execute() method; HITL resume returns A2A
+services/libs/agentic-engine/src/nodes/StartNode.ts
+Zod-based inputValidation
+services/libs/agentic-engine/src/index.ts
+Re-exports A2A types / collector / transformer
+frontend/src/components/canvas/panel-content/EndpointsPanelContent.tsx
+Endpoints panel UI
+
+Retained as legacy (only buildErrorMessage is called)
+
+File	Status
+services/libs/agentic-engine/src/workflow-execution/A2AResponseTransformer.ts
+Success path is dead code; kept for error helper
+No new runtime dependencies (zod is already in the workspace).
+
+12. Consequences
+Positive
+Open-standard response — any A2A client can consume our agents without custom code.
+Content order preserved end-to-end (G2) with zero builder effort (G10).
+PV and A2UI widgets as first-class response citizens (G3).
+Clean metadata separation (G4).
+No code duplication between stream and invoke (G5).
+HITL works on invoke (G6).
+Errors look the same as successes (uniform A2A Messages).
+Negative
+Invoke runs the full streaming pipeline (minor overhead).
+Three invoke versions coexist until deprecation.
+Legacy A2AResponseTransformer is dead code in the success path — kept for errors only.
+
+Neutral
+/stream unchanged.
+V0/V1 invoke unchanged.
+No new runtime dependencies.
+
+Appendix A — AG-UI events and how V2 uses them
+Event	Consumed by collector?
+RUN_STARTED
+No
+RUN_FINISHED
+Yes — source of metadata.output
+RUN_ERROR
+Yes — immediate resolve as FAILED
+TEXT_MESSAGE_START
+No (implicit)
+TEXT_MESSAGE_CONTENT
+Yes — appended to text buffer
+TEXT_MESSAGE_END
+Yes — flush text part
+TOOL_CALL_START / ARGS / END / RESULT
+No
+STEP_STARTED / FINISHED
+No
+STATE_SNAPSHOT / STATE_DELTA
+No
+REASONING_ENCRYPTED_VALUE
+No
+CUSTOM / PV_PRE_RENDER
+Yes — open PV buffer
+CUSTOM / PV_TEMPLATE
+Yes — set PV template
+CUSTOM / PV_POST_RENDER
+Yes — push PV part
+CUSTOM / A2UI_MESSAGE
+Yes — push A2UI part
+CUSTOM / on_interrupt
+Yes — mark INTERRUPTED
+
+Appendix B — End-to-end trace
+Same "Show me my recent orders" scenario, with the events the stream emits:
+
+RUN_STARTED
+TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT("Here are your recent orders:") → TEXT_MESSAGE_END
+CUSTOM / PV_PRE_RENDER (toolCallId: t1, delta: "Looking up order...")
+CUSTOM / PV_TEMPLATE (toolCallId: t1, delta: "<OrderTracker orderId='12345' />")
+CUSTOM / PV_POST_RENDER (toolCallId: t1, delta: "Order found.")
+TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT("Let me know if you need anything else.") → TEXT_MESSAGE_END
+RUN_FINISHED (result.output = { selectedAgentId, selectedAgentName, messages: [...] })
+
+After event	parts	textBuffer	pvBuffers
+2 (TEXT_END)
+[{text:"Here are..."}]
+""
+{}
+3 (PV_PRE)
+same
+""
+{t1:{preText:"Looking...",template:"",postText:""}}
+4 (PV_TEMPLATE)
+same
+""
+{t1:{preText:"Looking...",template:"<OrderTracker/>",postText:""}}
+5 (PV_POST)
+[{text:"Here are..."}, {data:{...},media_type:"pv"}]
+""
+{}
+6 (TEXT_END)
+[{text:"Here are..."}, {data:{...},media_type:"pv"}, {text:"Let me know..."}]
+""
+{}
+7 (RUN_FINISHED)
+same
+""
+{} + metadata built
+Only streamed content reaches the response; state-only updates are invisible.
+
