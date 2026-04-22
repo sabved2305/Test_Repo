@@ -402,7 +402,7 @@ A2AStreamCollector.collect(stream$, runId, sessionId): Promise<A2AMessage>
 
 - `parts: A2APart[]` — the ordered output being built.
 - `textBuffer: string` — in-flight text between `TEXT_MESSAGE_START` and `TEXT_MESSAGE_END`.
-- `pvBuffers: Map<toolCallId`, { preText, template, postText }> — in-flight PV widget, keyed by toolCallId (the ID carried on all three PV_* events so pre/template/post reliably pair up).
+- `pvBuffers: Map<toolCallId>`, { preText, template, postText }> — in-flight PV widget, keyed by toolCallId (the ID carried on all three PV_* events so pre/template/post reliably pair up).
 - `hitlInterrupt: object | null` — latest `on_interrupt` payload, if any.
 
 **Event → action**
@@ -450,10 +450,9 @@ flowchart LR
 4. If `parts` is still empty — fall back to the last AI message from `output.messages` as a single text part.
 5. Resolve `{ message_id: 'msg_' + runId, role: 'agent', parts, metadata }`.
 
-**Early resolve on error**. If a RUN_ERROR event arrives mid-stream, the collector short-circuits — it resolves immediately with a FAILED A2A Message and discards any buffered content. The complete handler above does not run.
+**Early resolve on error.** If a `RUN_ERROR` event arrives mid-stream, the collector short-circuits — it resolves immediately with a `FAILED` A2A Message and discards any buffered content. The `complete` handler above does not run.
 
-**Interrupt text fallback**. If the on_interrupt payload has no payload.message, the collector pushes a default text part: "Action required before the workflow can continue."
-
+**Interrupt text fallback.** If the `on_interrupt` payload has no `payload.message`, the collector pushes a default text part: *"Action required before the workflow can continue."*
 **Ignored events** — `TOOL_CALL_*`, `STEP_*`, `STATE_*`, `REASONING_ENCRYPTED_VALUE`, `RUN_STARTED`, `TEXT_MESSAGE_START` (implicit).
 
 ### 4.3 Metadata
@@ -560,7 +559,7 @@ async execute(id: string, invokeRequest: InvokeRequestDto): Promise<A2AMessage> 
 }
 ```
 
-Three points worth noting:
+Points worth noting:
 
 - **`streamMode: 'verbose'` is forced.** `minimal` mode would drop PV widgets.
 - **Runtime headers** — execute() writes RuntimeToken onto this.request.headers and forwards the full headers map to WorkflowExecutionHelper.buildGraphRequest(...). Tools needing header-based auth receive the same headers the stream path does. buildRuntimeContextForRequest(...) is a separate contributor (it supplies envVars and workflowMetaData, not headers).
@@ -679,7 +678,7 @@ No new runtime dependencies — `zod` is already in the workspace.
 
 | Test type                      | Coverage                                                                                          |
 | ------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Unit — `A2AStreamCollector`    | Text-only, `text → widget → text` order, concurrent PV tools, A2UI, HITL, `RUN_ERROR`, fallback   |
+| Unit — `A2AStreamCollector`    | Text-only, `text → widget → text` order, sequential PV tool, A2UI, HITL, `RUN_ERROR`, fallback    |
 | Unit — metadata                | `messages` excluded; custom output keys preserved                                                 |
 | Unit — `StartNode` validation  | Required fields, type mismatches, `minLength` / `enum` / `pattern`                                |
 | Integration — `invokeV2`       | End-to-end on both apps; includes HITL resume                                                     |
